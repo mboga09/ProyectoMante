@@ -87,5 +87,8 @@ for modoOp in range(6):
 df = df.drop(columns=['sensor1', 'sensor5', 'sensor6', 'sensor8', 'sensor9', 'sensor10', 'sensor13', 'sensor14', 'sensor16', 'sensor17', 'sensor18', 'sensor19', 'sensor20', 'sensor21'])
 print(df.describe())
 
+# Opino que se podría hacer que una vez se haga la normalización y eliminación de ruido se podría guardar el resultado en otro csv ya procesado, y que el código de la red 
+# neuronal lo que lea sea ese
+
 input("Presionar Enter para cerrar plots.")
 plt.close('all') 
