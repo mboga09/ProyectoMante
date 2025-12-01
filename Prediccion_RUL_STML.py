@@ -1,0 +1,404 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.signal import savgol_filter
+from scipy.ndimage import median_filter
+from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+
+import seaborn as sns
+import math
+
+# Ruta del archivo CSV separado por espacios
+ruta_archivo = 'C:\\Users\\mboga\\OneDrive\\Documentos\\Mante\\train.txt'
+
+# Definir las etiquetas para cada una de las columnas
+columnas = ["id", "cycles", "config1", "config2", "config3"]
+for i in range(21):
+    columnas.append("sensor" + str(i + 1))
+# Leer el archivo usando separador de espacio
+df = pd.read_csv(ruta_archivo, sep=r"\s+", engine="python", names=columnas)
+
+# Separación en modos de operación hecha según publicación 1 mencionada en la Explicación y Guía de Uso
+# (se puede comentar para mejorar tiempo de ejecución)
+# fig = plt.figure()
+# ax = fig.add_subplot(projection='3d')
+
+# x = df.config1
+# y = df.config2
+# z = df.config3
+
+# ax.scatter(x,y,z)
+# ax.set_xlabel("Config op 1")
+# ax.set_ylabel("Config op 2")
+# ax.set_zlabel("Config op 3")
+# ax.view_init(elev=0, azim=-90, roll=0)
+# plt.show()
+
+
+# Categorización por modo de operación de cada una de las filas de datos
+modosOp = []
+for rowID in range(len(df)):  # para cada fila de la base de datos
+    row = df.iloc[rowID]
+    modoOperacion = 0
+    # Se categoriza utilizando condiciones
+    if row.config1 <= 5:
+        modoOperacion = 1
+    elif row.config1 <= 15:
+        modoOperacion = 2
+    elif row.config1 <= 21:
+        modoOperacion = 3
+    elif row.config1 <= 30:
+        modoOperacion = 4
+    elif row.config1 <= 38:
+        modoOperacion = 5
+    else:
+        modoOperacion = 6
+    modosOp.append(modoOperacion)
+# Se cambian las variables de configuración operacional por una sola que va de 1 a 6 (inclusive)
+df.insert(2, "opSetting", modosOp)
+df = df.drop(columns=['config1', 'config2', 'config3'])
+
+# Se obtiene el número de motores que hay en la base de datos
+numeroDeMotores = np.max(df["id"])
+
+# Estandarizar el número de ciclos (para poder comparar entre motores distintos)
+numCiclosMotores = []
+for i in range(numeroDeMotores):
+    numCiclosMotor = len(df[df.id == i + 1])
+    numCiclosMotores.extend([numCiclosMotor] * numCiclosMotor)
+# El número de ciclos ahora será el número de ciclo menos la vida total que tuvo ese motor
+df.cycles = df.cycles - numCiclosMotores
+
+# Para generar visualización del comportamiento de cierto sensor en cada modo de operación por sepearado
+# (se puede comentar para mejorar tiempo ejecución)
+for modoOp in range(6):
+    datosModoOp = df[df.opSetting == modoOp + 1]
+    print("Modo: ", modoOp)
+    print(datosModoOp)
+    plt.figure()
+    plt.scatter(datosModoOp.cycles, datosModoOp.sensor21)
+    plt.pause(0.001)
+
+# Sensores descartados: 1, 5, 6 (por std despreciable), 8 (porque hacia el final algunos datos agarran para arriba y otros para abajo), 9 (por alta varianza en el final), 10
+# (por baja std), 13 (en varios modosOP da alta varianza al final), 14 (alta varianza), 16, 17 (valores independientes de modoOP pero organizados), 18, 19, 20 (alta variabilidad),
+# 21 (tendencia poco clara por muy alta variabilidad)
+# -- Los anteriores se descartaron por ser constantes para cada modo de operación (o por la razón entre paréntesis)
+
+# Se eliminan las columnas de los sensores mencionados
+df = df.drop(
+    columns=['sensor1', 'sensor5', 'sensor6', 'sensor8', 'sensor9', 'sensor10', 'sensor13', 'sensor14', 'sensor16',
+             'sensor17', 'sensor18', 'sensor19', 'sensor20', 'sensor21'])
+print(df.describe())
+
+# Opino que se podría hacer que una vez se haga la normalización y eliminación de ruido se podría guardar el resultado en otro csv ya procesado, y que el código de la red
+# neuronal lo que lea sea ese
+
+input("Presionar Enter para cerrar plots.")
+plt.close('all')
+
+# Tratamiento de ruido
+
+print("\n=== INICIANDO TRATAMIENTO DE RUIDO ===")
+
+
+# Esta función marca valores muy extremos por IQR y los reemplaza por la mediana del grupo
+def eliminar_outliers_IQR(df_grupo, columna, factor=1.5):
+    Q1 = df_grupo[columna].quantile(0.25)
+    Q3 = df_grupo[columna].quantile(0.75)
+    IQR = Q3 - Q1
+
+    limite_inferior = Q1 - factor * IQR
+    limite_superior = Q3 + factor * IQR
+
+    mediana = df_grupo[columna].median()
+    df_grupo.loc[
+        (df_grupo[columna] < limite_inferior) |
+        (df_grupo[columna] > limite_superior),
+        columna
+    ] = mediana
+    return df_grupo
+
+
+# Aquí defino qué sensores voy a filtrar (todos los que quedaron después de Carlos)
+sensores_a_filtrar = [col for col in df.columns if 'sensor' in col]
+df_filtrado = df.copy()
+
+print("Aplicando filtros de ruido por motor y por modo de operación...")
+for motor_id in range(1, numeroDeMotores + 1):
+    for modo in range(1, 7):
+        # Me quedo solo con las filas de este motor en este modo
+        mask = (df_filtrado['id'] == motor_id) & (df_filtrado['opSetting'] == modo)
+        if mask.sum() < 5:
+            # Si casi no hay datos para este caso, prefiero no tocarlo
+            continue
+
+        indices = df_filtrado[mask].index
+
+        # Primero trabajo cada sensor con Savitzky-Golay para quitar ruido de alta frecuencia
+        for sensor in sensores_a_filtrar:
+            datos_sensor = df_filtrado.loc[mask, sensor].values
+
+            if len(datos_sensor) >= 5:
+                window_length = min(7, len(datos_sensor))
+                if window_length % 2 == 0:
+                    window_length -= 1
+                if window_length >= 3:
+                    datos_suavizados = savgol_filter(
+                        datos_sensor,
+                        window_length=window_length,
+                        polyorder=2
+                    )
+                    df_filtrado.loc[indices, sensor] = datos_suavizados
+
+        # Después del suavizado, reviso outliers por IQR y los pego a la mediana local
+        for sensor in sensores_a_filtrar:
+            df_grupo = df_filtrado.loc[mask, ['id', 'cycles', 'opSetting', sensor]].copy()
+            df_grupo = eliminar_outliers_IQR(df_grupo, sensor, factor=2.0)
+            df_filtrado.loc[mask, sensor] = df_grupo[sensor].values
+
+print("Filtrado de ruido completado.")
+
+# Normalización de datos (Max–Min estilo artículo, pero hecha a mano)
+print("\n=== INICIANDO NORMALIZACIÓN MAX–MIN (RANGO [-1,1]) ===")
+
+# Trabajo sobre una copia ya filtrada para no perder el original de Carlos
+df_normalizado = df_filtrado.copy()
+
+# Calculo min y max por sensor
+min_vals = df_filtrado[sensores_a_filtrar].min()
+max_vals = df_filtrado[sensores_a_filtrar].max()
+rango = (max_vals - min_vals).replace(0, 1.0)
+
+# Escalo cada sensor al rango [-1, 1]
+df_normalizado[sensores_a_filtrar] = -1 + 2 * (
+        (df_filtrado[sensores_a_filtrar] - min_vals) / rango
+)
+
+print("Normalización Max–Min completada.")
+
+# Verificación, visualización y guardado
+print("\n=== ESTADÍSTICAS DESPUÉS DEL PROCESAMIENTO ===")
+print(df_normalizado[sensores_a_filtrar].describe())
+
+# Aquí solo se muestra un ejemplo antes/después para un motor y un sensor para tener una idea visual
+# Si María quiere lo puede comentar o quitar para hacerlo más rápido
+motor_ejemplo = 1
+sensor_ejemplo = 'sensor2'
+
+plt.figure(figsize=(12, 5))
+
+# Datos originales después de la parte de Carlos
+plt.subplot(1, 2, 1)
+datos_originales = df[df['id'] == motor_ejemplo]
+plt.scatter(datos_originales['cycles'], datos_originales[sensor_ejemplo],
+            c=datos_originales['opSetting'], cmap='viridis', alpha=0.6)
+plt.title(f'Motor {motor_ejemplo} - {sensor_ejemplo} (Antes de mi procesamiento)')
+plt.xlabel('Ciclos')
+plt.ylabel('Valor del sensor')
+plt.colorbar(label='Modo de operación')
+
+# Datos ya filtrados y normalizados
+plt.subplot(1, 2, 2)
+datos_procesados = df_normalizado[df_normalizado['id'] == motor_ejemplo]
+plt.scatter(datos_procesados['cycles'], datos_procesados[sensor_ejemplo],
+            c=datos_procesados['opSetting'], cmap='viridis', alpha=0.6)
+plt.title(f'Motor {motor_ejemplo} - {sensor_ejemplo} (Filtrado + Normalizado)')
+plt.xlabel('Ciclos')
+plt.ylabel('Valor normalizado')
+plt.colorbar(label='Modo de operación')
+
+plt.tight_layout()
+plt.show()
+
+# Guardado del DataFrame procesado a un nuevo CSV
+df_normalizado.to_csv('train_procesado.csv', index=False)
+print("Datos guardados en 'train_procesado.csv'.")
+
+# Preparación de datos para el modelo (features y target)
+print("\n=== PREPARACIÓN FINAL DE DATOS PARA LA RED ===")
+
+# RUL como vida útil remanente: cycles ya está en negativo por el ajuste de Carlos
+df_normalizado['RUL'] = -df_normalizado['cycles']
+
+# Features: modos de operación + sensores procesados
+features_cols = ['opSetting'] + sensores_a_filtrar
+X = df_normalizado[features_cols].values
+y = df_normalizado['RUL'].values
+ids_motores = df_normalizado['id'].values
+
+print(f"Dimensiones de X (características): {X.shape}")
+print(f"Dimensiones de y (RUL): {y.shape}")
+print(f"Rango de RUL: [{y.min()}, {y.max()}]")
+
+
+#   CREAR SECUENCIAS (LOOKBACK)
+
+def crear_secuencias(X, y, ids, lookback):
+    X_seq, y_seq = [], []
+
+    for motor in np.unique(ids):
+        idx = np.where(ids == motor)[0]
+        X_m = X[idx]
+        y_m = y[idx]
+
+        for i in range(len(X_m) - lookback):
+            X_seq.append(X_m[i:i+lookback])
+            y_seq.append(y_m[i+lookback])
+
+    return np.array(X_seq), np.array(y_seq), X.shape[1]
+
+
+
+#   DEFINIR LOOKBACK
+
+LOOKBACK = 1   # puede ser 1, 5, 10, 20
+
+
+print(f"\n=== Secuencias Lookback={LOOKBACK} ===")
+X_seq, y_seq, n_features = crear_secuencias(X, y, ids_motores, LOOKBACK)
+
+
+
+#   SPLIT
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X_seq, y_seq, test_size=0.2, shuffle=True, random_state=42
+)
+
+
+# Convertir a tensores
+X_train_t = torch.tensor(X_train, dtype=torch.float32)
+X_test_t = torch.tensor(X_test, dtype=torch.float32)
+y_train_t = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1)
+y_test_t = torch.tensor(y_test, dtype=torch.float32).unsqueeze(1)
+
+train_loader = DataLoader(TensorDataset(X_train_t, y_train_t), batch_size=64, shuffle=True)
+val_loader   = DataLoader(TensorDataset(X_test_t,  y_test_t), batch_size=64, shuffle=False)
+
+
+
+#   MODELO LSTM
+
+class LSTM_RUL(nn.Module):
+    def __init__(self, n_features):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size=n_features, hidden_size=64, batch_first=True)
+        self.fc1 = nn.Linear(64, 32)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(32, 1)
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        out = out[:, -1, :]           # tomar último paso
+        out = self.relu(self.fc1(out))
+        return self.fc2(out)
+
+
+model = LSTM_RUL(n_features)
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+
+
+#   ENTRENAMIENTO
+
+train_losses = []
+val_losses   = []
+
+EPOCHS = 75
+
+print("\n Entrenamiento de modelo")
+
+for epoch in range(EPOCHS):
+    model.train()
+    batch_losses = []
+    for xb, yb in train_loader:
+        optimizer.zero_grad()
+        pred = model(xb)
+        loss = criterion(pred, yb)
+        loss.backward()
+        optimizer.step()
+        batch_losses.append(loss.item())
+
+    train_losses.append(np.mean(batch_losses))
+
+    # VALIDACIÓN
+    model.eval()
+    with torch.no_grad():
+        preds = model(X_test_t)
+        val_loss = criterion(preds, y_test_t).item()
+        val_losses.append(val_loss)
+
+    print(f"Epoch {epoch+1}/{EPOCHS} | Loss={train_losses[-1]:.4f} | Val={val_loss:.4f}")
+
+
+
+#   GRÁFICA 1 — Pérdidas
+
+plt.figure(figsize=(10,5))
+plt.plot(train_losses, label="Pérdida de entrenamiento")
+plt.plot(val_losses, label="Pérdida de validación")
+plt.legend()
+plt.title(f"Pérdidas — LSTM con Lookback={LOOKBACK}")
+plt.xlabel("Época")
+plt.ylabel("Pérdida de MSE")
+plt.grid()
+plt.show()
+
+
+
+#   PREDICCIONES (train y test)
+
+model.eval()
+train_pred = model(X_train_t).detach().numpy()
+test_pred  = model(X_test_t).detach().numpy()
+
+
+
+#   MÉTRICAS
+
+print("\n===== Metricas Train =====")
+print("MSE:", mean_squared_error(y_train, train_pred))
+print("RMSE:", math.sqrt(mean_squared_error(y_train, train_pred)))
+print("MAE:", mean_absolute_error(y_train, train_pred))
+
+print("\n===== Metricas Test =====")
+print("MSE:", mean_squared_error(y_test, test_pred))
+print("RMSE:", math.sqrt(mean_squared_error(y_test, test_pred)))
+print("MAE:", mean_absolute_error(y_test, test_pred))
+
+
+
+#   GRÁFICA 2 — Predicción vs RUL Real
+
+N = 100  # Motores a graficar
+pred_100 = test_pred[:N]
+y_test_100 = y_test[:N]
+
+plt.figure(figsize=(18, 8))
+plt.plot(pred_100, color='red', label='Predicción')
+plt.plot(y_test_100, color='blue', label='RUL real')
+plt.title(f"Predicción de RUL utilizando LSTM — Lookback={LOOKBACK}", fontsize=25)
+plt.xlabel("Número de Motor", fontsize=20)
+plt.ylabel("RUl", fontsize=20)
+plt.legend()
+plt.grid()
+plt.show()
+
+
+#   VIDA MÁXIMA, MEDIA Y MÍNIMA POR MOTOR
+
+max_cycles_por_motor = []
+for motor in np.unique(ids_motores):
+    idx_motor = np.where(ids_motores == motor)[0]
+    RUL_motor = y[idx_motor]
+    max_cycles_por_motor.append(max(RUL_motor))
+
+print("Max Life  :", max(max_cycles_por_motor))
+print("Mean Life :", np.mean(max_cycles_por_motor))
+print("Min Life  :", min(max_cycles_por_motor))
