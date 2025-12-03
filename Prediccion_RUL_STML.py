@@ -225,6 +225,13 @@ print("\n=== PREPARACIÓN FINAL DE DATOS PARA LA RED ===")
 # RUL como vida útil remanente: cycles ya está en negativo por el ajuste de Carlos
 df_normalizado['RUL'] = -df_normalizado['cycles']
 
+#   Implementación de RUL Clipping (usado en el paper)
+RUL_MAX = 130
+print(f"Aplicando RUL Clipping: RUL máximo establecido a {RUL_MAX}")
+# Se asegura que ningún valor de RUL en el conjunto de entrenamiento sea mayor que RUL_MAX
+df_normalizado['RUL'] = df_normalizado['RUL'].clip(upper=RUL_MAX)
+# ===================================================
+
 # Features: modos de operación + sensores procesados
 features_cols = ['opSetting'] + sensores_a_filtrar
 X = df_normalizado[features_cols].values
@@ -235,9 +242,7 @@ print(f"Dimensiones de X (características): {X.shape}")
 print(f"Dimensiones de y (RUL): {y.shape}")
 print(f"Rango de RUL: [{y.min()}, {y.max()}]")
 
-
-#   CREAR SECUENCIAS (LOOKBACK)
-
+#   Crear secuencias (lookback)
 def crear_secuencias(X, y, ids, lookback):
     X_seq, y_seq = [], []
 
@@ -246,73 +251,121 @@ def crear_secuencias(X, y, ids, lookback):
         X_m = X[idx]
         y_m = y[idx]
 
+        # generar secuencias válidas
         for i in range(len(X_m) - lookback):
-            X_seq.append(X_m[i:i+lookback])
-            y_seq.append(y_m[i+lookback])
+            X_seq.append(X_m[i:i + lookback])
+            y_seq.append(y_m[i + lookback])
 
     return np.array(X_seq), np.array(y_seq), X.shape[1]
 
+LOOKBACK = 30 # Lookback usado en el paper
 
-
-#   DEFINIR LOOKBACK
-
-LOOKBACK = 1   # puede ser 1, 5, 10, 20
-
-
-print(f"\n=== Secuencias Lookback={LOOKBACK} ===")
+print(f"\n=== GENERANDO SECUENCIAS LOOKBACK={LOOKBACK} ===")
 X_seq, y_seq, n_features = crear_secuencias(X, y, ids_motores, LOOKBACK)
 
 
-
-#   SPLIT
-
+#   Separar 80% train / 20% test
 X_train, X_test, y_train, y_test = train_test_split(
-    X_seq, y_seq, test_size=0.2, shuffle=True, random_state=42
+    X_seq, y_seq, test_size=0.2, shuffle=False
 )
 
-
-# Convertir a tensores
+#   Tensores
 X_train_t = torch.tensor(X_train, dtype=torch.float32)
 X_test_t = torch.tensor(X_test, dtype=torch.float32)
 y_train_t = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1)
 y_test_t = torch.tensor(y_test, dtype=torch.float32).unsqueeze(1)
 
 train_loader = DataLoader(TensorDataset(X_train_t, y_train_t), batch_size=64, shuffle=True)
-val_loader   = DataLoader(TensorDataset(X_test_t,  y_test_t), batch_size=64, shuffle=False)
+val_loader = DataLoader(TensorDataset(X_test_t, y_test_t), batch_size=64, shuffle=False)
 
+#   Crear IDs para secuencias
+ids_seq = []
+for motor in np.unique(ids_motores):
+    idx = np.where(ids_motores == motor)[0]
+    n = len(idx)
+    ids_seq.extend([motor] * (n - LOOKBACK))
 
+ids_seq = np.array(ids_seq)
 
-#   MODELO LSTM
+train_ids_seq = ids_seq[:len(X_train)]
+test_ids_seq = ids_seq[len(X_train):]
 
+#   Modelo LSTM
 class LSTM_RUL(nn.Module):
     def __init__(self, n_features):
         super().__init__()
-        self.lstm = nn.LSTM(input_size=n_features, hidden_size=64, batch_first=True)
-        self.fc1 = nn.Linear(64, 32)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(32, 1)
+
+        # --- Capa 1: LSTM (50 unidades) ---
+        # En el artículo se usa L2 Regularization
+        self.lstm1 = nn.LSTM(
+            input_size=n_features,
+            hidden_size=50,  # 50 unidades
+            num_layers=1,
+            batch_first=True,
+        )
+
+        # --- Dropout 1 (0.4) ---
+        self.dropout1 = nn.Dropout(0.4)  # Primer Dropout
+
+        # --- Capa 2: LSTM (25 unidades) ---
+        # La entrada es la salida de lstm1 (hidden_size=50)
+        self.lstm2 = nn.LSTM(
+            input_size=50,
+            hidden_size=25,  # 25 unidades
+            num_layers=1,
+            batch_first=True,
+        )
+
+        # --- Dropout 2 (0.4) ---
+        self.dropout2 = nn.Dropout(0.4)  # Segundo Dropout
+
+        # --- Capa de Salida (1 neurona) ---
+        # La entrada es la salida de lstm2 (hidden_size=25)
+        self.fc = nn.Linear(25, 1)
 
     def forward(self, x):
-        out, _ = self.lstm(x)
-        out = out[:, -1, :]           # tomar último paso
-        out = self.relu(self.fc1(out))
-        return self.fc2(out)
+        # Pasar por la primera LSTM
+        out, _ = self.lstm1(x)
+        # Aplicar Dropout 1
+        out = self.dropout1(out)
+
+        # Pasar por la segunda LSTM
+        out, _ = self.lstm2(out)
+        # Aplicar Dropout 2
+        out = self.dropout2(out)
+
+        # Tomar el último paso de tiempo para la predicción RUL
+        return self.fc(out[:, -1, :])
 
 
 model = LSTM_RUL(n_features)
 criterion = nn.MSELoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
+#   Optimizador (L2 Regularization)
+# En el artículo usa L2 Regularization con un factor de 0.01.
+L2_FACTOR = 0.01
+optimizer = torch.optim.Adam(
+    model.parameters(),
+    lr=0.001,
+    weight_decay=L2_FACTOR  # Implementación de L2 Regularization
+)
 
+#   Entrenamiento guardando el mejor modelo
+train_losses = []  # MSE por secuencia
+val_losses = []  # MSE por secuencia
+# Listas para el RMSE
+train_rmse_list = []
+val_rmse_list = []
+best_val_rmse = float('inf')
+best_epoch = 0
+EPOCHS = 75 #En el paper usan 100 pero se decide dejar en 75 porque no generaba mayor diferencia
 
-#   ENTRENAMIENTO
+# Función auxiliar para obtener las predicciones completas
+def get_predictions(model, X_data_t):
+    model.eval()
+    with torch.no_grad():
+        return model(X_data_t).cpu().numpy().reshape(-1)
 
-train_losses = []
-val_losses   = []
-
-EPOCHS = 75
-
-print("\n Entrenamiento de modelo")
 
 for epoch in range(EPOCHS):
     model.train()
@@ -325,80 +378,149 @@ for epoch in range(EPOCHS):
         optimizer.step()
         batch_losses.append(loss.item())
 
-    train_losses.append(np.mean(batch_losses))
+    train_loss_epoch = np.mean(batch_losses)
+    train_losses.append(train_loss_epoch)
 
-    # VALIDACIÓN
+    # Calcular train RMES
+    train_rmse = math.sqrt(train_loss_epoch)
+    train_rmse_list.append(train_rmse)
+
+    # Validación
     model.eval()
     with torch.no_grad():
         preds = model(X_test_t)
         val_loss = criterion(preds, y_test_t).item()
         val_losses.append(val_loss)
 
-    print(f"Epoch {epoch+1}/{EPOCHS} | Loss={train_losses[-1]:.4f} | Val={val_loss:.4f}")
+    # Calcular validation RMES
+    val_rmse = math.sqrt(val_loss)
+    val_rmse_list.append(val_rmse)
+
+    # Guardar mejor modelo
+    if val_rmse < best_val_rmse:
+        best_val_rmse = val_rmse
+        best_epoch = epoch + 1
+        # Guardar una copia del modelo
+        best_model_state = model.state_dict().copy()
+        print(
+            f"Epoch {epoch + 1}/{EPOCHS} | Train Loss={train_loss_epoch:.4f} | Val Loss={val_loss:.4f} | Train RMSE={train_rmse:.4f} | Val RMSE={val_rmse:.4f} *** NUEVO MEJOR MODELO ***")
+    else:
+        print(
+            f"Epoch {epoch + 1}/{EPOCHS} | Train Loss={train_loss_epoch:.4f} | Val Loss={val_loss:.4f} | Train RMSE={train_rmse:.4f} | Val RMSE={val_rmse:.4f}")
 
 
+#   Predicciones finales (con el mejor modelo)
+# Cargar el mejor modelo encontrado para las métricas finales
+model.load_state_dict(best_model_state)
 
-#   GRÁFICA 1 — Pérdidas
+# Predicciones y valores reales
+train_pred_final = get_predictions(model, X_train_t)
+test_pred_final = get_predictions(model, X_test_t)
 
-plt.figure(figsize=(10,5))
-plt.plot(train_losses, label="Pérdida de entrenamiento")
-plt.plot(val_losses, label="Pérdida de validación")
-plt.legend()
-plt.title(f"Pérdidas — LSTM con Lookback={LOOKBACK}")
-plt.xlabel("Época")
-plt.ylabel("Pérdida de MSE")
-plt.grid()
+train_y_final = y_train
+test_y_final = y_test
+
+#   Métricas
+print("\n=== Métricas Test ===")
+print("MSE:", mean_squared_error(test_y_final, test_pred_final))
+print("MAE:", mean_absolute_error(test_y_final, test_pred_final))
+
+#   Gráfica de curvas de apredizaje
+train_rmse = train_rmse_list
+val_rmse = val_rmse_list
+
+# Encontrar el mejor epoch
+best_epoch = np.argmin(val_rmse) + 1
+best_val_rmse = min(val_rmse)
+
+# Crear la gráfica
+plt.figure(figsize=(10, 6))
+epochs_range = range(1, EPOCHS + 1)
+
+# Plotear curvas
+plt.plot(epochs_range, train_rmse, 'b-', linewidth=2, label='RMSE de Entrenamiento')
+plt.plot(epochs_range, val_rmse, 'r-', linewidth=2, label='RMSE de Validación')
+
+# Marcar el mejor epoch
+plt.axvline(x=best_epoch, color='green', linestyle='--', linewidth=1.5,
+            label=f'Mejor época ({best_epoch})')
+plt.plot(best_epoch, best_val_rmse, 'go', markersize=10)
+
+# Etiquetas y título
+plt.xlabel('Época', fontsize=12, fontweight='bold')
+plt.ylabel('Raíz del Error Cuadrático Medio (RMSE)', fontsize=12, fontweight='bold')
+plt.title('Curvas de Aprendizaje: Rendimiento del Modelo por época', fontsize=14, fontweight='bold')
+
+# Leyenda y grid
+plt.legend(loc='best', fontsize=10)
+plt.grid(True, alpha=0.3)
+
+# Ajustar márgenes
+plt.tight_layout()
+
+# Guardar y mostrar
+plt.savefig('learning_curves_standard_rmse.png', dpi=300, bbox_inches='tight')
+print(f"Mejor época: {best_epoch} con Validation RMSE: {best_val_rmse:.4f}")
+
 plt.show()
 
 
+#   Gráfica de RUL real vs predicho
+import matplotlib.pyplot as plt
+import numpy as np
 
-#   PREDICCIONES (train y test)
+# Asegurar que el límite del RUL sea el máximo usado en el clipping (130)
+RUL_MAX_LIM = 130
 
-model.eval()
-train_pred = model(X_train_t).detach().numpy()
-test_pred  = model(X_test_t).detach().numpy()
+# Crear la figura
+plt.figure(figsize=(8, 8))
 
+# 1. Graficar la Línea Ideal (Predicted = Actual)
+# Se usa el RUL_MAX_LIM como referencia para la línea diagonal
+plt.plot([0, RUL_MAX_LIM], [0, RUL_MAX_LIM],
+         'r--', linewidth=4, label='Línea Ideal (Predicho = Real)')
 
+# 2. Plot de las Predicciones (Model prediction)
+plt.scatter(test_y_final, test_pred_final,
+            color='blue', alpha=0.6, label='Predicción del Modelo')
 
-#   MÉTRICAS
+# Etiquetas y Título
+plt.title('RUL Real vs Predicho', fontsize=14, fontweight='bold')
+plt.xlabel('RUL Real (ciclos)', fontsize=12, fontweight='bold')
+plt.ylabel('RUL Predicho (ciclos)', fontsize=12, fontweight='bold')
 
-print("\n===== Metricas Train =====")
-print("MSE:", mean_squared_error(y_train, train_pred))
-print("RMSE:", math.sqrt(mean_squared_error(y_train, train_pred)))
-print("MAE:", mean_absolute_error(y_train, train_pred))
+# Límites del Eje
+plt.xlim([0, RUL_MAX_LIM * 1.05])
+plt.ylim([0, RUL_MAX_LIM * 1.05])
 
-print("\n===== Metricas Test =====")
-print("MSE:", mean_squared_error(y_test, test_pred))
-print("RMSE:", math.sqrt(mean_squared_error(y_test, test_pred)))
-print("MAE:", mean_absolute_error(y_test, test_pred))
+# Leyenda y Grid
+plt.legend(loc='lower right', fontsize=10)
+plt.grid(True, alpha=0.3)
 
+# Ajustar márgenes
+plt.tight_layout()
+plt.savefig('actual_vs_predicted_rul.png', dpi=300, bbox_inches='tight')
 
-
-#   GRÁFICA 2 — Predicción vs RUL Real
-
-N = 100  # Motores a graficar
-pred_100 = test_pred[:N]
-y_test_100 = y_test[:N]
-
-plt.figure(figsize=(18, 8))
-plt.plot(pred_100, color='red', label='Predicción')
-plt.plot(y_test_100, color='blue', label='RUL real')
-plt.title(f"Predicción de RUL utilizando LSTM — Lookback={LOOKBACK}", fontsize=25)
-plt.xlabel("Número de Motor", fontsize=20)
-plt.ylabel("RUl", fontsize=20)
-plt.legend()
-plt.grid()
 plt.show()
 
 
-#   VIDA MÁXIMA, MEDIA Y MÍNIMA POR MOTOR
+# RUL  predicho por motor
+print("\n=== ÚLTIMO RUL POR MOTOR ===\n")
 
-max_cycles_por_motor = []
-for motor in np.unique(ids_motores):
-    idx_motor = np.where(ids_motores == motor)[0]
-    RUL_motor = y[idx_motor]
-    max_cycles_por_motor.append(max(RUL_motor))
+# Obtener los motores presentes en el conjunto test
+unique_motors = np.unique(test_ids_seq)
 
-print("Max Life  :", max(max_cycles_por_motor))
-print("Mean Life :", np.mean(max_cycles_por_motor))
-print("Min Life  :", min(max_cycles_por_motor))
+for motor in unique_motors:
+    # Índices donde aparece este motor en el conjunto test
+    idx = np.where(test_ids_seq == motor)[0]
+
+    if len(idx) == 0:
+        continue
+
+    # Último índice disponible para ese motor (última secuencia)
+    last_idx = idx[-1]
+
+    real_rul = test_y_final[last_idx]
+    pred_rul = test_pred_final[last_idx]
+
+    print(f"Motor {motor}:  RUL predicho = {pred_rul:.2f}")
